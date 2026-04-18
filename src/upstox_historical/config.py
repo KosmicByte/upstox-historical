@@ -44,8 +44,22 @@ def get_settings() -> Settings:
 
 
 def configure_logging(level: str = "INFO") -> None:
+    """
+    Configure root logging.
+
+    Silences noisy third-party loggers (httpx, httpcore, urllib3) unless
+    DEBUG is explicitly requested via ``--verbose`` / ``-v``. Without this,
+    httpx emits one INFO line per HTTP request — fine for debugging, but
+    visually overwhelming for normal multi-chunk fetches.
+    """
     logging.basicConfig(
         level=getattr(logging, level),
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    # Quiet third-party per-request logs at INFO level.
+    # --verbose still surfaces everything because it sets level=DEBUG globally.
+    if level != "DEBUG":
+        for noisy in ("httpx", "httpcore", "urllib3"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)

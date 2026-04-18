@@ -10,6 +10,20 @@ Data sources
 
 - Turnover is computed locally from VWAP × Volume per candle.
 
+Caching
+-------
+Parsed Bhav Copies are cached to disk under
+``~/.cache/upstox-historical/bhav/`` (one parquet per trading date,
+plus ``.miss`` marker files for non-trading days). Subsequent runs that
+need the same date get a cache hit and skip the NSE round-trip.
+
+Progress reporting
+------------------
+``enrich()`` accepts an optional ``progress_cb`` callable that is invoked
+after each Bhav Copy lookup (cache hit or network fetch). The callback
+receives ``(completed, total, current_date)`` — the CLI uses this to
+render a Rich progress bar instead of per-date INFO log lines.
+
 Logic
 -----
 For daily/weekly/monthly intervals:
@@ -17,10 +31,6 @@ For daily/weekly/monthly intervals:
 
 For intraday intervals (1min, 5min, 30min etc.):
     - Bhav Copy values are at day level → broadcast to all candles of that date.
-    - Trades: use the daily total (same value repeated for every candle of that day).
-    - Deliverable Volume: same daily value repeated.
-    - %Deliverble: same daily value repeated.
-    - Prev Close: close of previous trading day (from Bhav Copy).
 
 Turnover is always computed locally per candle:
     turnover = round(vwap * volume)    [in Rupees, matching NSE convention]
@@ -30,14 +40,22 @@ from __future__ import annotations
 import io
 import logging
 import time
-from datetime import date, timedelta
-from functools import lru_cache
+from datetime import date
 from typing import Callable, Optional
 
 import httpx
 import pandas as pd
 
+from upstox_historical.cache import (
+    bhav_load,
+    bhav_mark_miss,
+    bhav_store,
+)
+
 logger = logging.getLogger(__name__)
+
+# Type alias: called as progress_cb(done, total, current_date)
+BhavProgressCB = Callable[[int, int, date], None]
 
 # ── NSE Bhav Copy URL template ────────────────────────────────────────────────
 _BHAV_URL = (
@@ -54,9 +72,6 @@ _BHAV_COLS_RENAME = {
     "DELIV_PER":      "%Deliverble",
 }
 
-# Columns we keep from the Bhav Copy
-_BHAV_KEEP = ["Symbol", "Series", "Prev Close", "Trades", "Deliverable Volume", "%Deliverble", "_trade_date"]
-
 # NSE request headers (required to avoid 403)
 _HEADERS = {
     "User-Agent": (
@@ -70,34 +85,48 @@ _HEADERS = {
     "Referer": "https://www.nseindia.com/",
 }
 
-_REQUEST_DELAY = 1.0   # seconds between NSE requests (be polite)
+_REQUEST_DELAY = 1.0   # seconds between NSE network requests (when not cached)
 _TIMEOUT = 20.0        # seconds
 
 
-# ── Internal cache: date-string → DataFrame (one Bhav Copy per day) ──────────
-_bhav_cache: dict[str, pd.DataFrame] = {}
+# ── Process-local cache (hot path) layered on top of disk cache ──────────────
+# Avoids re-reading the same parquet many times within one process.
+_bhav_memcache: dict[str, pd.DataFrame] = {}
 
 
 def _fetch_bhav(trade_date: date) -> Optional[pd.DataFrame]:
     """
-    Download and parse NSE Bhav Copy for a single trading date.
-    Returns None if the date is not a trading day (file not found).
-    Caches results in memory to avoid duplicate downloads.
+    Return the Bhav Copy DataFrame for `trade_date`.
+
+    Lookup order:
+      1. Process-local memory cache.
+      2. On-disk parquet cache.
+      3. Miss marker (confirmed non-trading day) — return None without network call.
+      4. NSE network fetch.
+
+    Returns None if the date is not a trading day.
     """
+    mem_key = trade_date.isoformat()
+    if mem_key in _bhav_memcache:
+        return _bhav_memcache[mem_key]
+
+    # Disk cache hit?
+    cached = bhav_load(trade_date)
+    if cached is not None:
+        _bhav_memcache[mem_key] = cached
+        return cached
+
+    # Network fetch
     date_str = trade_date.strftime("%d%m%Y")
-    cache_key = date_str
-
-    if cache_key in _bhav_cache:
-        return _bhav_cache[cache_key]
-
     url = _BHAV_URL.format(date=date_str)
-    logger.info("NSE Bhav Copy: fetching %s", url)
+    logger.debug("NSE Bhav Copy: fetching %s", url)
 
     try:
         with httpx.Client(headers=_HEADERS, timeout=_TIMEOUT, follow_redirects=True) as client:
             resp = client.get(url)
         if resp.status_code == 404:
             logger.debug("Bhav Copy not found for %s (holiday/weekend)", trade_date)
+            bhav_mark_miss(trade_date)
             return None
         resp.raise_for_status()
     except httpx.HTTPError as exc:
@@ -123,7 +152,11 @@ def _fetch_bhav(trade_date: date) -> Optional[pd.DataFrame]:
     df = df[cols_present].copy()
     df["_trade_date"] = trade_date
 
-    _bhav_cache[cache_key] = df
+    # Store to both caches
+    _bhav_memcache[mem_key] = df
+    bhav_store(trade_date, df)
+
+    # Politeness delay only when we actually hit the network
     time.sleep(_REQUEST_DELAY)
     return df
 
@@ -135,25 +168,28 @@ def _unique_trading_dates(df: pd.DataFrame) -> list[date]:
 
 def _get_bhav_for_dates(
     dates: list[date],
-    on_progress: "Callable[[int, int], None] | None" = None,
+    progress_cb: Optional[BhavProgressCB] = None,
 ) -> pd.DataFrame:
     """
-    Fetch Bhav Copy for all given dates.
-    Returns a combined DataFrame with _trade_date column.
+    Fetch Bhav Copy for all given dates, emitting progress updates.
 
     Parameters
     ----------
-    on_progress : callable, optional
-        Called as on_progress(current, total) after each date is fetched.
+    dates : list[date]
+        Trading dates to enrich.
+    progress_cb : callable, optional
+        Invoked as ``progress_cb(done, total, current_date)`` after each
+        date is resolved (from cache or network). Allows the CLI to render
+        a progress bar without coupling this module to Rich.
     """
-    frames: list[pd.DataFrame] = []
     total = len(dates)
+    frames: list[pd.DataFrame] = []
     for idx, d in enumerate(dates, start=1):
         bdf = _fetch_bhav(d)
         if bdf is not None:
             frames.append(bdf)
-        if on_progress:
-            on_progress(idx, total)
+        if progress_cb is not None:
+            progress_cb(idx, total, d)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
@@ -162,17 +198,9 @@ def _get_bhav_for_dates(
 def _extract_symbol(instrument_key: str) -> str:
     """
     Extract a human-readable ticker symbol from an Upstox instrument key.
-
-    Examples
-    --------
-    "NSE_EQ|INE002A01018"   → looked up from ISIN (or user must configure)
-    "NSE_INDEX|Nifty 50"    → "Nifty 50"
-    "NSE_EQ|RELIANCE"       → "RELIANCE"  (if trading_symbol format)
     """
     if "|" in instrument_key:
         right = instrument_key.split("|", 1)[1]
-        # If it looks like an ISIN (INE...) we return as-is for now;
-        # the Bhav Copy merge will use the Symbol already configured
         return right
     return instrument_key
 
@@ -200,8 +228,7 @@ def enrich(
     symbol: Optional[str] = None,
     series: Optional[str] = None,
     is_intraday: bool = False,
-    on_bhav_progress: "Callable[[int, int], None] | None" = None,
-    on_merge_start: "Callable[[], None] | None" = None,
+    progress_cb: Optional[BhavProgressCB] = None,
 ) -> pd.DataFrame:
     """
     Enrich an Upstox OHLCV DataFrame with NSE Bhav Copy columns.
@@ -209,29 +236,29 @@ def enrich(
     Parameters
     ----------
     df : pd.DataFrame
-        Output of HistoricalFetcher.fetch() — must have columns:
-        timestamp, open, high, low, close, volume, vwap
+        Output of ``HistoricalFetcher.fetch()`` — must have columns
+        timestamp, open, high, low, close, volume, vwap.
     instrument_key : str
-        e.g. "NSE_EQ|INE002A01018"
+        e.g. ``"NSE_EQ|INE002A01018"``.
     symbol : str, optional
-        Override ticker symbol (e.g. "RELIANCE"). If not provided, derived
-        from instrument_key. **Strongly recommended** for ISIN-keyed equities.
+        Override ticker symbol (e.g. ``"RELIANCE"``). **Required for
+        ISIN-keyed equities** since Bhav Copy is keyed by ticker, not ISIN.
     series : str, optional
-        Override series (e.g. "EQ"). If not provided, derived from instrument_key.
+        Override series (e.g. ``"EQ"``).
     is_intraday : bool
-        If True, Bhav Copy values (Trades, Deliverable Volume, %Deliverble)
-        are broadcast to all candles belonging to the same trading day.
-    on_bhav_progress : callable, optional
-        Called as on_bhav_progress(current, total) after each Bhav Copy date fetch.
-    on_merge_start : callable, optional
-        Called when the merge phase begins.
+        If True, Bhav Copy values are broadcast to all candles of the same
+        trading day.
+    progress_cb : callable, optional
+        Invoked as ``progress_cb(done, total, current_date)`` after each
+        trading date's Bhav Copy is resolved. Used by the CLI for the
+        enrichment progress bar.
 
     Returns
     -------
     pd.DataFrame
         Columns matching Sample.csv:
         timestamp, Symbol, Series, Prev Close, open, high, low, close,
-        volume, vwap, Turnover, Trades, Deliverable Volume, %Deliverble
+        volume, vwap, Turnover, Trades, Deliverable Volume, %Deliverble.
     """
     if df.empty:
         return df
@@ -245,24 +272,22 @@ def enrich(
     df["Series"] = resolved_series
 
     # ── 2. Turnover (computed locally: vwap × volume per candle) ─────
-    # NSE reports Turnover in Rupees. vwap * volume gives Rupee value per candle.
     if "vwap" in df.columns:
         df["Turnover"] = (df["vwap"] * df["volume"]).round(0).astype("int64")
     else:
-        # Fallback: typical_price × volume
         typical = (df["high"] + df["low"] + df["close"]) / 3
         df["Turnover"] = (typical * df["volume"]).round(0).astype("int64")
 
     # ── 3. NSE Bhav Copy enrichment ───────────────────────────────────
     trading_dates = _unique_trading_dates(df)
     logger.info(
-        "NSE Enrichment: fetching Bhav Copy for %d trading date(s): %s … %s",
+        "NSE Enrichment: resolving Bhav Copy for %d trading date(s): %s … %s",
         len(trading_dates),
         trading_dates[0] if trading_dates else "–",
         trading_dates[-1] if trading_dates else "–",
     )
 
-    bhav = _get_bhav_for_dates(trading_dates, on_progress=on_bhav_progress)
+    bhav = _get_bhav_for_dates(trading_dates, progress_cb=progress_cb)
 
     if bhav.empty:
         logger.warning(
@@ -293,9 +318,6 @@ def enrich(
         return _finalise_columns(df)
 
     # ── 4. Merge Bhav Copy onto candles by date ───────────────────────
-    if on_merge_start:
-        on_merge_start()
-
     df["_trade_date"] = df["timestamp"].dt.date
 
     bhav_day = bhav_sym[
@@ -305,43 +327,48 @@ def enrich(
     df = df.merge(bhav_day, on="_trade_date", how="left")
     df = df.drop(columns=["_trade_date"])
 
-    # For intraday: Prev Close = close of the PREVIOUS candle (per day)
-    # but since Bhav Copy already gives yesterday's close, keep it as-is —
-    # it is the correct "previous session close" for the day, broadcast to all
-    # intraday rows of that date.  This matches the Sample.csv behaviour.
-
     logger.info("NSE Enrichment complete. Enriched %d rows.", len(df))
     return _finalise_columns(df)
 
 
 def _finalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Reorder columns to match Sample.csv layout and drop open_interest.
+    Reorder and capitalize columns to match Sample.csv layout and drop open_interest.
+
+    OHLCV columns are capitalized on the way out (Open, High, Low, Close, Volume, VWAP)
+    to match standard financial-data conventions. Internal processing uses lowercase
+    to stay consistent with Upstox API field names; this is the one translation point.
     """
-    # Drop open_interest (not needed)
     if "open_interest" in df.columns:
         df = df.drop(columns=["open_interest"])
 
-    # Desired column order matching Sample.csv
+    # Capitalize OHLCV columns (VWAP is all-caps by convention, not Vwap)
+    rename_map = {
+        "open":   "Open",
+        "high":   "High",
+        "low":    "Low",
+        "close":  "Close",
+        "volume": "Volume",
+        "vwap":   "VWAP",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
     col_order = [
-        "timestamp",      # will be renamed to Date by fetcher
+        "timestamp",
         "Symbol",
         "Series",
         "Prev Close",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "vwap",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+        "VWAP",
         "Turnover",
         "Trades",
         "Deliverable Volume",
         "%Deliverble",
     ]
-
-    # Only keep columns that exist
     col_order = [c for c in col_order if c in df.columns]
-    # Append any extra columns not in the order (shouldn't happen normally)
     extras = [c for c in df.columns if c not in col_order]
     return df[col_order + extras]

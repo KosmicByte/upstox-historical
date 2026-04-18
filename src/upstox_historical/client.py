@@ -1,5 +1,18 @@
 """
 client.py — thin httpx wrapper around the Upstox v2 REST API.
+
+Synchronous client. For high-throughput fetches (many chunks or many
+instruments), prefer :class:`upstox_historical.async_client.AsyncUpstoxClient`
+which does concurrency + rate limiting natively.
+
+Resilience
+----------
+All requests are wrapped in a tenacity retry decorator that:
+
+- Retries up to 5 times on 5xx, 429, and connection errors.
+- Uses exponential backoff (1s, 2s, 4s, 8s, ...capped at 30s).
+- Does NOT retry on 401 (auth fails — user must re-run OAuth).
+- Does NOT retry on 4xx other than 429.
 """
 from __future__ import annotations
 
@@ -7,12 +20,20 @@ import logging
 from typing import Any
 
 import httpx
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from upstox_historical.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT = 30.0  # seconds
+_DEFAULT_TIMEOUT = 30.0
+_DEFAULT_RETRY_ATTEMPTS = 5
 
 
 class UpstoxAuthError(Exception):
@@ -27,9 +48,22 @@ class UpstoxAPIError(Exception):
         super().__init__(f"HTTP {status_code}: {message}")
 
 
+class _TransientHTTPError(Exception):
+    """Internal marker exception used to trigger retries on 5xx/429."""
+
+
+# Exceptions we retry on (transient network/server issues)
+_RETRYABLE_EXCEPTIONS = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+    _TransientHTTPError,
+)
+
+
 class UpstoxClient:
     """
-    Synchronous HTTP client for the Upstox v2 API.
+    Synchronous HTTP client for the Upstox v2 API with retries.
 
     Usage::
 
@@ -44,6 +78,7 @@ class UpstoxClient:
         access_token: str | None = None,
         settings: Settings | None = None,
         timeout: float = _DEFAULT_TIMEOUT,
+        retry_attempts: int = _DEFAULT_RETRY_ATTEMPTS,
     ) -> None:
         self._settings = settings or get_settings()
         self._token = access_token or self._settings.access_token
@@ -60,6 +95,7 @@ class UpstoxClient:
             headers=self._build_headers(),
             timeout=timeout,
         )
+        self._retry_attempts = retry_attempts
         logger.debug("UpstoxClient initialised (base_url=%s)", self._base_url)
 
     # ── private ──────────────────────────────────────────
@@ -72,26 +108,22 @@ class UpstoxClient:
         }
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        # We construct the retry decorator at call time so `retry_attempts`
+        # can be configured per-instance.
+        decorated = retry(
+            stop=stop_after_attempt(self._retry_attempts),
+            wait=wait_exponential(multiplier=1, min=1, max=30),
+            retry=retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        )(self._get_once)
+        return decorated(path, params)
+
+    def _get_once(self, path: str, params: dict[str, Any] | None) -> dict[str, Any]:
         logger.debug("GET %s  params=%s", path, params)
         response = self._http.get(path, params=params)
-        self._raise_for_status(response)
+        _raise_for_status(response)
         return response.json()  # type: ignore[return-value]
-
-    @staticmethod
-    def _raise_for_status(response: httpx.Response) -> None:
-        if response.status_code == 401:
-            raise UpstoxAuthError(
-                "401 Unauthorised — your access token is invalid or expired. "
-                "Re-run the OAuth flow (see README)."
-            )
-        if response.status_code == 429:
-            raise UpstoxAPIError(429, "Rate limit exceeded. Please wait before retrying.")
-        if response.is_error:
-            try:
-                msg = response.json().get("errors", [{}])[0].get("message", response.text)
-            except Exception:
-                msg = response.text
-            raise UpstoxAPIError(response.status_code, msg)
 
     # ── public API ────────────────────────────────────────
 
@@ -158,3 +190,34 @@ class UpstoxClient:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+# ── module-level helpers ─────────────────────────────────────────────
+
+def _raise_for_status(response: httpx.Response) -> None:
+    """
+    Map an httpx Response to our exception hierarchy.
+
+    401 → UpstoxAuthError (NOT retried)
+    429 → _TransientHTTPError (retried with backoff)
+    5xx → _TransientHTTPError (retried with backoff)
+    other → UpstoxAPIError (NOT retried)
+    """
+    sc = response.status_code
+    if sc == 401:
+        raise UpstoxAuthError(
+            "401 Unauthorised — your access token is invalid or expired. "
+            "Re-run: uv run upstox-fetch login"
+        )
+    if sc == 429:
+        logger.warning("429 rate-limit from Upstox — backing off and retrying")
+        raise _TransientHTTPError("429 rate-limited")
+    if 500 <= sc < 600:
+        logger.warning("%d server error from Upstox — retrying", sc)
+        raise _TransientHTTPError(f"{sc} server error")
+    if response.is_error:
+        try:
+            msg = response.json().get("errors", [{}])[0].get("message", response.text)
+        except Exception:
+            msg = response.text
+        raise UpstoxAPIError(sc, msg)

@@ -2,6 +2,17 @@
 fetcher.py — high-level interface that converts raw API responses
              into clean pandas DataFrames and saves them to disk.
 
+This module has both:
+
+- The **sync** :class:`HistoricalFetcher`, which preserves the original
+  V1 interface for scripts that rely on it.
+- **Shared constants** (chunking rules, interval maps) imported by
+  ``async_fetcher``, so both paths stay in lockstep.
+
+For large historical fetches or multi-instrument batches, consider
+:class:`upstox_historical.async_fetcher.AsyncHistoricalFetcher` — it's
+5–10× faster via concurrency and supports resume-on-failure.
+
 Chunked fetching
 ----------------
 Upstox enforces per-request date-range limits:
@@ -12,7 +23,7 @@ Upstox enforces per-request date-range limits:
     week     → max 10 years per request
     month    → max 10 years per request
 
-fetch() and fetch_and_save() automatically split large date ranges
+``fetch()`` and ``fetch_and_save()`` automatically split large date ranges
 into chunks, fetch each chunk with a small delay, and stitch results
 together — so you can request 10 years of 5-min data in one call.
 """
@@ -21,12 +32,18 @@ from __future__ import annotations
 import logging
 import time
 from datetime import date, timedelta
-from dateutil.relativedelta import relativedelta
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Iterator
 
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 
+from upstox_historical.cache import (
+    checkpoint_clear,
+    checkpoint_dir,
+    checkpoint_load,
+    checkpoint_store,
+)
 from upstox_historical.client import UpstoxClient
 from upstox_historical.models import HistoricalResponse, Interval
 from upstox_historical.nse_enrichment import enrich
@@ -57,51 +74,42 @@ _FETCH_AS: dict[str, str] = {
 }
 
 # ── Max date range per single API request (conservative, within Upstox limits)
-# Keys are the interval we actually request from Upstox.
 _CHUNK_SIZE: dict[str, relativedelta] = {
     "1minute":  relativedelta(months=1),
-    "30minute": relativedelta(months=11),   # 1 year, kept slightly under
+    "30minute": relativedelta(months=11),
     "day":      relativedelta(months=11),
     "week":     relativedelta(years=9),
     "month":    relativedelta(years=9),
 }
 
-# Delay between consecutive API requests (seconds) to avoid rate limiting
+# Delay between consecutive API requests (seconds) — only for the sync path
 _REQUEST_DELAY = 0.6
 
 
 class HistoricalFetcher:
     """
-    High-level helper that wraps :class:`UpstoxClient` and returns DataFrames.
+    Sync high-level helper that wraps :class:`UpstoxClient` and returns DataFrames.
 
     Key features
     ~~~~~~~~~~~~
-    - Automatic chunking: large date ranges are split and stitched transparently.
-    - Resampled intervals: 2/3/5/10/15/20/25-minute built from 1-min data.
-    - VWAP: computed per trading day, appended as a column.
-    - Progress logging: see how many chunks have been fetched.
+    - Automatic chunking with checkpoint resume on failure.
+    - Resampled intervals (2/3/5/10/15/20/25-minute) from 1-min base.
+    - Per-day VWAP, NSE Bhav Copy enrichment.
+    - Friendly retries via tenacity (see :class:`UpstoxClient`).
 
-    Example::
-
-        fetcher = HistoricalFetcher()
-
-        # 10 years of 5-min Nifty — ~120 API requests, handled automatically
-        df = fetcher.fetch(
-            instrument_key="NSE_INDEX|Nifty 50",
-            interval="5minute",
-            from_date="2015-01-01",
-            to_date="2025-03-31",
-        )
-        print(df.shape)   # (187500, 8)
+    For many-chunk or many-instrument fetches, consider
+    ``async_fetcher.AsyncHistoricalFetcher`` which runs requests concurrently.
     """
 
     def __init__(
         self,
         client: UpstoxClient | None = None,
         request_delay: float = _REQUEST_DELAY,
+        use_checkpoints: bool = True,
     ) -> None:
         self._client = client or UpstoxClient()
         self._delay = request_delay
+        self._use_checkpoints = use_checkpoints
 
     # ── public ────────────────────────────────────────────────────────
 
@@ -115,38 +123,13 @@ class HistoricalFetcher:
         nse_enrich: bool = False,
         symbol: str | None = None,
         series: str | None = None,
-        on_chunk_progress: Callable[[int, int], None] | None = None,
-        on_bhav_progress: Callable[[int, int], None] | None = None,
-        on_merge_start: Callable[[], None] | None = None,
+        enrich_progress_cb=None,
     ) -> pd.DataFrame:
         """
         Fetch historical candles for any date range, auto-chunking as needed.
 
-        Parameters
-        ----------
-        instrument_key : str
-            e.g. ``"NSE_INDEX|Nifty 50"``
-        interval : str | Interval
-            Any supported interval including 5minute, 15minute etc.
-        from_date : str
-            Start date ``YYYY-MM-DD``
-        to_date : str
-            End date   ``YYYY-MM-DD``
-        add_vwap : bool
-            Append a per-day cumulative VWAP column (default True).
-        on_chunk_progress : callable, optional
-            Called as on_chunk_progress(current, total) after each Upstox chunk.
-        on_bhav_progress : callable, optional
-            Forwarded to nse_enrichment.enrich().
-        on_merge_start : callable, optional
-            Forwarded to nse_enrichment.enrich().
-
-        Returns
-        -------
-        pd.DataFrame
-            Columns: timestamp, open, high, low, close, volume,
-                     open_interest[, vwap]
-            Sorted ascending by timestamp, duplicates removed.
+        Sync implementation (keeps the original V1 interface). For speed,
+        prefer :class:`AsyncHistoricalFetcher.fetch`.
         """
         interval_val = interval.value if isinstance(interval, Interval) else interval
         self._validate_interval(interval_val)
@@ -156,6 +139,11 @@ class HistoricalFetcher:
         chunks     = list(self._date_chunks(from_date, to_date, chunk_size))
         total      = len(chunks)
 
+        ckpt = (
+            checkpoint_dir(instrument_key, fetch_as, from_date, to_date)
+            if self._use_checkpoints else None
+        )
+
         logger.info(
             "Fetching %s | %s | %s → %s  (%d chunk%s, fetch_as=%s)",
             instrument_key, interval_val, from_date, to_date,
@@ -164,9 +152,21 @@ class HistoricalFetcher:
 
         frames: list[pd.DataFrame] = []
         for idx, (chunk_from, chunk_to) in enumerate(chunks, start=1):
+            # Try checkpoint first
+            if ckpt is not None:
+                cached = checkpoint_load(ckpt, idx)
+                if cached is not None:
+                    logger.info(
+                        "  Chunk %d/%d: %s → %s  [cached]",
+                        idx, total, chunk_from, chunk_to,
+                    )
+                    if not cached.empty:
+                        frames.append(cached)
+                    continue
+
             logger.info(
-                "  Chunk %d/%d: %s → %s", idx, total,
-                chunk_from.isoformat(), chunk_to.isoformat(),
+                "  Chunk %d/%d: %s → %s",
+                idx, total, chunk_from.isoformat(), chunk_to.isoformat(),
             )
             raw = self._client.get_historical_candles(
                 instrument_key=instrument_key,
@@ -175,17 +175,20 @@ class HistoricalFetcher:
                 to_date=chunk_to.isoformat(),
             )
             df_chunk = self._parse(raw, instrument_key)
+
+            if ckpt is not None and not df_chunk.empty:
+                checkpoint_store(ckpt, idx, df_chunk)
+
             if not df_chunk.empty:
                 frames.append(df_chunk)
-
-            if on_chunk_progress:
-                on_chunk_progress(idx, total)
 
             if idx < total:
                 time.sleep(self._delay)
 
         if not frames:
             logger.warning("No data returned for %s in the requested range.", instrument_key)
+            if ckpt is not None:
+                checkpoint_clear(ckpt)
             return pd.DataFrame(columns=_CANDLE_COLS)
 
         df = pd.concat(frames, ignore_index=True)
@@ -213,22 +216,14 @@ class HistoricalFetcher:
                 symbol=symbol,
                 series=series,
                 is_intraday=_is_intraday,
-                on_bhav_progress=on_bhav_progress,
-                on_merge_start=on_merge_start,
+                progress_cb=enrich_progress_cb,
             )
-            # Rename timestamp → Date for final output
             if "timestamp" in df.columns:
                 df = df.rename(columns={"timestamp": "Date"})
 
-            # ── Rename columns to title case ──────────────────────────────────
-        _col_rename = {
-            "open": "Open",
-            "close": "Close",
-            "high": "High",
-            "low": "Low",
-            "vwap": "VWAP",
-        }
-        df = df.rename(columns={k: v for k, v in _col_rename.items() if k in df.columns})
+        # Clean up checkpoints on successful completion
+        if ckpt is not None:
+            checkpoint_clear(ckpt)
 
         return df
 
@@ -283,33 +278,16 @@ class HistoricalFetcher:
         nse_enrich: bool = False,
         symbol: str | None = None,
         series: str | None = None,
-        on_chunk_progress: Callable[[int, int], None] | None = None,
-        on_bhav_progress: Callable[[int, int], None] | None = None,
-        on_merge_start: Callable[[], None] | None = None,
+        enrich_progress_cb=None,
     ) -> Path:
-        """
-        Fetch (with auto-chunking) and save to disk.
-
-        Parameters
-        ----------
-        fmt : str
-            ``"csv"`` or ``"parquet"`` (parquet recommended for large datasets)
-        nse_enrich : bool
-            If True, enrich with NSE Bhav Copy data before saving.
-        symbol : str, optional
-            NSE ticker (e.g. ``"RELIANCE"``). Needed when nse_enrich=True.
-        series : str, optional
-            NSE series (e.g. ``"EQ"``).
-        """
+        """Fetch (with auto-chunking) and save to disk."""
         df = self.fetch(
             instrument_key, interval, from_date, to_date,
             add_vwap=add_vwap,
             nse_enrich=nse_enrich,
             symbol=symbol,
             series=series,
-            on_chunk_progress=on_chunk_progress,
-            on_bhav_progress=on_bhav_progress,
-            on_merge_start=on_merge_start,
+            enrich_progress_cb=enrich_progress_cb,
         )
         return self._save(df, instrument_key, interval, from_date, to_date, out_dir, fmt)
 
@@ -356,10 +334,7 @@ class HistoricalFetcher:
 
     @staticmethod
     def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-        """
-        Resample 1-min OHLCV to a higher timeframe using standard aggregation.
-        Bars with no data (e.g. pre/post market) are dropped.
-        """
+        """Resample 1-min OHLCV to a higher timeframe using standard aggregation."""
         df = df.set_index("timestamp")
         resampled = df.resample(rule, label="left", closed="left").agg(
             open=("open",   "first"),
@@ -377,13 +352,7 @@ class HistoricalFetcher:
 
     @staticmethod
     def _add_vwap(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Append per-day cumulative VWAP.
-
-        Formula: VWAP = cumsum(typical_price × volume) / cumsum(volume)
-        where typical_price = (high + low + close) / 3.
-        Resets at midnight IST each trading day.
-        """
+        """Append per-day cumulative VWAP."""
         df = df.copy()
         df["_date"]   = df["timestamp"].dt.date
         typical       = (df["high"] + df["low"] + df["close"]) / 3
@@ -411,6 +380,20 @@ class HistoricalFetcher:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
 
+        # Capitalize OHLCV columns on save for consistency. Enriched output
+        # already has these capitalized (done inside _finalise_columns), so
+        # this rename is only effective when enrichment was skipped.
+        rename_map = {
+            "timestamp": "Date",
+            "open":      "Open",
+            "high":      "High",
+            "low":       "Low",
+            "close":     "Close",
+            "volume":    "Volume",
+            "vwap":      "VWAP",
+        }
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
         interval_str = interval.value if isinstance(interval, Interval) else interval
         safe_key     = instrument_key.replace("|", "_").replace(" ", "_")
         stem         = f"{safe_key}_{interval_str}_{from_date}_{to_date}"
@@ -437,6 +420,6 @@ class HistoricalFetcher:
             )
 
 
-# Module-level alias so CLI can import _date_chunks directly
+# Module-level alias so CLI can import _date_chunks directly (back-compat)
 def _date_chunks(from_date, to_date, chunk_size):
     yield from HistoricalFetcher._date_chunks(from_date, to_date, chunk_size)
