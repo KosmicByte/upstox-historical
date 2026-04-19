@@ -1,10 +1,19 @@
-# upstox-historical
+<p align="center">
+  <img src="assets/logo.svg" alt="upstox-historical" width="120" />
+</p>
 
-> Fetch, update, chart, and validate historical OHLCV data from the **Upstox v2 API** — clean DataFrames, CSV/Parquet output, full CLI, async + interactive.
+<h1 align="center">upstox-historical</h1>
 
-[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)]()
-[![Version](https://img.shields.io/badge/version-1.1.0-brightgreen.svg)]()
-[![License](https://img.shields.io/badge/license-MIT-green.svg)]()
+<p align="center">
+  Fetch, update, chart, and validate historical OHLCV data from the <b>Upstox v2 API</b><br>
+  Clean DataFrames · CSV/Parquet output · full CLI · async + interactive
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python" />
+  <img src="https://img.shields.io/badge/version-1.1.0-brightgreen.svg" alt="Version" />
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License" />
+</p>
 
 ---
 

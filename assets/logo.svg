@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" fill="none">
+  <!-- Background rounded square -->
+  <rect x="10" y="10" width="180" height="180" rx="32" fill="#0F172A"/>
+
+  <!-- Grid lines -->
+  <g stroke="#1E293B" stroke-width="1">
+    <line x1="25" y1="60"  x2="175" y2="60"/>
+    <line x1="25" y1="100" x2="175" y2="100"/>
+    <line x1="25" y1="140" x2="175" y2="140"/>
+  </g>
+
+  <!-- Candlesticks: mix of green and red, varied heights. Wick thin, body thicker. -->
+  <!-- Candle 1: green up -->
+  <line x1="42" y1="70"  x2="42" y2="130" stroke="#10B981" stroke-width="2"/>
+  <rect x="37" y="90"  width="10" height="30" fill="#10B981"/>
+
+  <!-- Candle 2: red down -->
+  <line x1="62" y1="55"  x2="62" y2="120" stroke="#EF4444" stroke-width="2"/>
+  <rect x="57" y="70"  width="10" height="40" fill="#EF4444"/>
+
+  <!-- Candle 3: green tall up -->
+  <line x1="82" y1="45"  x2="82" y2="115" stroke="#10B981" stroke-width="2"/>
+  <rect x="77" y="55"  width="10" height="50" fill="#10B981"/>
+
+  <!-- Candle 4: green small up -->
+  <line x1="102" y1="50" x2="102" y2="90"  stroke="#10B981" stroke-width="2"/>
+  <rect x="97" y="60"  width="10" height="20" fill="#10B981"/>
+
+  <!-- Candle 5: red down -->
+  <line x1="122" y1="60" x2="122" y2="135" stroke="#EF4444" stroke-width="2"/>
+  <rect x="117" y="75" width="10" height="45" fill="#EF4444"/>
+
+  <!-- Candle 6: green recover -->
+  <line x1="142" y1="40" x2="142" y2="110" stroke="#10B981" stroke-width="2"/>
+  <rect x="137" y="50" width="10" height="50" fill="#10B981"/>
+
+  <!-- Candle 7: green small -->
+  <line x1="162" y1="55" x2="162" y2="95"  stroke="#10B981" stroke-width="2"/>
+  <rect x="157" y="65" width="10" height="25" fill="#10B981"/>
+
+  <!-- Trend line overlay -->
+  <path d="M 35 110 Q 80 75, 125 95 T 170 65"
+        stroke="#38BDF8" stroke-width="2.5" fill="none"
+        stroke-linecap="round" stroke-dasharray="4 4" opacity="0.75"/>
+
+  <!-- Subtle baseline arrow implying upward trend -->
+  <path d="M 30 165 L 170 165" stroke="#334155" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M 160 160 L 170 165 L 160 170" stroke="#334155" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
