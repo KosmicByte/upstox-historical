@@ -3,6 +3,7 @@
 > Fetch, update, chart, and validate historical OHLCV data from the **Upstox v2 API** — clean DataFrames, CSV/Parquet output, full CLI, async + interactive.
 
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.1.0-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)]()
 
 ---
@@ -10,6 +11,7 @@
 ## Table of contents
 
 - [What's new in v1.1.0](#whats-new-in-v110)
+- [Output schema](#output-schema)
 - [Quick start](#quick-start)
   - [1 — Clone and install](#1--clone-and-install)
   - [2 — Upstox credentials](#2--upstox-credentials)
@@ -36,37 +38,58 @@
 - [Built-in instrument keys](#built-in-instrument-keys)
 - [Project structure](#project-structure)
 - [How features work (under the hood)](#how-features-work-under-the-hood)
-  - [Chunking](#chunking)
-  - [Checkpoint resume](#checkpoint-resume)
-  - [Bhav Copy disk cache](#bhav-copy-disk-cache)
-  - [Rate limiting and retries](#rate-limiting-and-retries)
-  - [NSE Bhav Copy enrichment](#nse-bhav-copy-enrichment)
 - [PyCharm setup](#pycharm-setup)
 - [Tests, linting, type checking](#tests-linting-type-checking)
 - [Upgrading from v1.0](#upgrading-from-v10)
 - [Troubleshooting](#troubleshooting)
 - [Rate limits and caveats](#rate-limits-and-caveats)
+- [Changelog](#changelog)
 - [License](#license)
 
 ---
 
 ## What's new in v1.1.0
 
-The backward-compatible feature bump. Every v1.0 script still works unchanged — the sync `HistoricalFetcher` interface is preserved. But there's a lot of new power:
+The backward-compatible feature release. Every v1.0 script still works — the sync `HistoricalFetcher` interface is preserved. But there's a lot of new power:
 
 - **Async fetcher** — concurrent chunk downloads with `aiolimiter`-backed rate limiting. 5–10× faster for long date ranges.
 - **Checkpoint resume** — every fetched chunk is persisted to disk. If your process dies mid-fetch, re-running picks up exactly where it left off.
 - **Tenacity retries** — transient 5xx, 429, and network errors are retried with exponential backoff. No more single-flake failures on multi-hour fetches.
 - **Incremental updates** — `upstox-fetch update ./data/file.parquet` fetches only the missing range since the last timestamp. Perfect for daily pipelines.
 - **Batch mode** — fetch many instruments concurrently through a shared rate limiter. Backfill 20 stocks in the time it used to take for 2.
-- **Disk-cached Bhav Copy** — NSE Bhav Copies are cached as parquet under `~/.cache/upstox-historical/bhav/`. Second run of the same enrichment hits disk, not NSE.
+- **Disk-cached Bhav Copy** — NSE Bhav Copies cached as parquet under `~/.cache/upstox-historical/bhav/`. Second run of the same enrichment hits disk, not NSE.
 - **Interactive Plotly charts** — candlesticks + volume + SMA/EMA/Bollinger/RSI/MACD/VWAP overlays, exported as standalone HTML.
-- **Data validation** — OHLC sanity, gap detection against the NSE trading calendar, log-return outlier detection.
+- **Data validation** — OHLC sanity, gap detection against the NSE trading calendar, log-return outlier detection. Case-insensitive column resolution, so it works on any old or new save.
 - **Interactive instrument search** — arrow-key navigable, clipboard copy on selection.
-- **Rich progress bars** — elapsed time, ETA, M/N chunks for `fetch` and `batch`.
+- **Two-stage Rich progress bars** — chunks + NSE enrichment, each showing elapsed and ETA.
+- **Capitalized output columns** — saved files now use `Date, Open, High, Low, Close, Volume, VWAP` for consistency with standard financial-data conventions. See [Output schema](#output-schema).
+- **Quieted httpx logging** — per-URL request logs only appear with `--verbose`.
 - **Cache inspection** — `upstox-fetch cache stats | clear-bhav | clear-checkpoints`.
 
-See [Upgrading from v1.0](#upgrading-from-v10) for the concrete upgrade path if you're coming from an existing install.
+See [Upgrading from v1.0](#upgrading-from-v10) for the concrete upgrade path.
+
+---
+
+## Output schema
+
+Saved files (CSV or Parquet) use these column names:
+
+**Without `--nse-enrich`:**
+
+```
+Date, Open, High, Low, Close, Volume, VWAP, open_interest
+```
+
+**With `--nse-enrich`:**
+
+```
+Date, Symbol, Series, Prev Close, Open, High, Low, Close, Volume, VWAP,
+Turnover, Trades, Deliverable Volume, %Deliverble
+```
+
+> **Note:** v1.0 used lowercase OHLCV (`open, high, low, close, volume, vwap`). v1.1 capitalizes these on save. If your downstream code reads lowercase column names, add a rename shim: `df.rename(columns=str.lower)` after loading. See [Upgrading from v1.0](#upgrading-from-v10).
+
+In-memory DataFrames returned by the Python API keep lowercase OHLCV during processing; the rename happens only at save time. So if you use `HistoricalFetcher.fetch()` and work with the DataFrame directly (without saving), you get lowercase columns — same as v1.0.
 
 ---
 
@@ -136,7 +159,7 @@ Done — three commands and you've got verified data plus a browsable chart.
 All commands are accessed via the `upstox-fetch` entry point. Run `upstox-fetch <command> --help` for complete options.
 
 Global flags:
-- `--verbose` / `-v` — enable DEBUG logging
+- `--verbose` / `-v` — enable DEBUG logging (re-enables per-URL httpx logs)
 - `--version` — print version and exit
 
 ### `fetch` — historical candles
@@ -176,6 +199,8 @@ uv run upstox-fetch fetch "NSE_EQ|INE002A01018" \
     --nse-enrich --symbol RELIANCE --series EQ \
     --format parquet
 ```
+
+> For ISIN-keyed equities, always pass `--symbol` explicitly. NSE Bhav Copy is keyed by ticker (`RELIANCE`), not ISIN (`INE002A01018`), so the enrichment can't auto-derive the ticker.
 
 ### `batch` — many instruments at once
 
@@ -221,7 +246,7 @@ uv run upstox-fetch intraday "NSE_INDEX|Nifty Bank" --interval 5minute
 
 ### `plot` — interactive charts
 
-Renders a standalone HTML with candlesticks, volume, and any combination of indicators. Opens in a browser on request.
+Renders a standalone HTML with candlesticks, volume, and any combination of indicators. Opens in a browser on request. Reads capitalized or lowercase column files transparently.
 
 ```bash
 uv run upstox-fetch plot ./data/reliance.parquet \
@@ -238,13 +263,13 @@ uv run upstox-fetch plot ./data/reliance.parquet \
 | `bb20` | Bollinger Bands (SMA ± 2σ over N periods) |
 | `rsi14` | Relative Strength Index over N periods (subplot) |
 | `macd` | MACD (12, 26, 9) with signal + histogram (subplot) |
-| `vwap_overlay` | Overlay the `vwap` column if present |
+| `vwap_overlay` | Overlay the `VWAP` column if present |
 
 Output defaults to `<filename>.html` next to the source.
 
 ### `validate` — data quality
 
-Runs the full quality-check suite on a saved file.
+Runs the full quality-check suite on a saved file. Case-insensitive — works on v1.0 and v1.1 files equally.
 
 ```bash
 uv run upstox-fetch validate ./data/reliance.parquet
@@ -298,7 +323,7 @@ uv run upstox-fetch keys                   # list built-in NSE instrument keys
 
 ### Sync fetcher
 
-Identical to v1.0 — no code changes needed.
+Identical to v1.0. **Note:** the in-memory DataFrame returned by `fetch()` still has lowercase OHLCV column names — capitalization happens only at save time.
 
 ```python
 from upstox_historical.fetcher import HistoricalFetcher
@@ -313,7 +338,15 @@ df = fetcher.fetch(
     from_date="2024-01-01",
     to_date="2024-12-31",
 )
-print(df.tail())
+print(df.tail())                     # lowercase columns
+
+path = fetcher.fetch_and_save(
+    instrument_key=NSE.NIFTY_50,
+    interval=Interval.D1,
+    from_date="2024-01-01",
+    to_date="2024-12-31",
+    fmt="parquet",
+)                                    # file has capitalized columns
 ```
 
 ### Async fetcher (recommended)
@@ -338,32 +371,6 @@ async def main():
     print(df.shape)
 
 asyncio.run(main())
-```
-
-**With a progress callback** (e.g. in Jupyter):
-
-```python
-from tqdm.asyncio import tqdm
-
-async def run():
-    fetcher = AsyncHistoricalFetcher()
-    pbar = None
-
-    def on_progress(done, total, chunk_from, chunk_to):
-        nonlocal pbar
-        if pbar is None:
-            pbar = tqdm(total=total)
-        pbar.n = done
-        pbar.refresh()
-
-    df = await fetcher.fetch(
-        "NSE_EQ|INE002A01018", "5minute",
-        "2020-01-01", "2025-10-31",
-        progress_cb=on_progress,
-    )
-    if pbar:
-        pbar.close()
-    return df
 ```
 
 ### Multi-instrument batch
@@ -400,11 +407,9 @@ asyncio.run(main())
 import asyncio
 from upstox_historical.updater import plan_update, update
 
-# Inspect first
 plan = plan_update("./data/NSE_EQ_INE002A01018_day_2020-01-01_2025-03-31.parquet")
 print(f"Need to fetch {plan.new_from} to {plan.new_to}")
 
-# Execute
 result = asyncio.run(update("./data/NSE_EQ_INE002A01018_day_2020-01-01_2025-03-31.parquet"))
 print(f"Updated to {result.path}")
 ```
@@ -414,15 +419,14 @@ print(f"Updated to {result.path}")
 ```python
 from upstox_historical.validation import validate, repair
 
-report = validate(df)
+report = validate(df)                # accepts any column casing
 print(report.summary())
 
 if report.errors:
-    # Best-effort cleanup
-    df = repair(df)
+    df = repair(df)                  # best-effort cleanup
 ```
 
-The `ValidationReport` dataclass exposes structured attributes: `errors`, `warnings`, `ohlc_violations`, `zero_volume_rows`, `missing_trading_days`, `outlier_rows`, etc. See `validation.py` for the full list.
+`ValidationReport` exposes structured fields: `errors`, `warnings`, `ohlc_violations`, `zero_volume_rows`, `missing_trading_days`, `outlier_rows`, etc.
 
 ### Charting
 
@@ -436,12 +440,6 @@ path = plot_candles(
     title="Reliance Industries",
     open_browser=True,
 )
-```
-
-You can also pass a DataFrame directly:
-
-```python
-plot_candles(df, indicators=["sma50", "vwap_overlay"])
 ```
 
 ---
@@ -462,8 +460,6 @@ plot_candles(df, indicators=["sma50", "vwap_overlay"])
 | `day`      | native  | daily (default) |
 | `week`     | native  | weekly |
 | `month`    | native  | monthly |
-
-"Resampled" intervals are constructed by fetching `1minute` data and aggregating client-side. They're correct but slower for long ranges (more API calls).
 
 ---
 
@@ -493,7 +489,7 @@ upstox-historical/
 │       ├── __init__.py             Package exports + version
 │       ├── auth.py                 OAuth login helper
 │       ├── cli.py                  Typer CLI (upstox-fetch)
-│       ├── config.py               Settings (pydantic + .env)
+│       ├── config.py               Settings + logging setup
 │       ├── instruments.py          NSE instrument key constants
 │       ├── models.py               Pydantic response models
 │       │
@@ -507,7 +503,7 @@ upstox-historical/
 │       │
 │       ├── cache.py               ⦿ Disk cache (Bhav + checkpoints)
 │       ├── updater.py             ⦿ Incremental update logic
-│       ├── validation.py          ⦿ Quality checks
+│       ├── validation.py          ⦿ Quality checks (case-insensitive)
 │       ├── plotting.py            ⦿ Plotly charting
 │       └── search.py              ⦿ Interactive instrument search
 │
@@ -540,11 +536,11 @@ Upstox caps per-request date ranges by interval:
 | week     | 10 years |
 | month    | 10 years |
 
-Both fetchers automatically split long ranges into chunks, fetch each, and stitch the result. For resampled intervals (2/3/5/10/15/20/25-minute), the fetcher requests `1minute` data and aggregates client-side.
+Both fetchers automatically split long ranges into chunks, fetch each, and stitch the result.
 
 ### Checkpoint resume
 
-Every completed chunk is immediately persisted as a parquet under
+Every completed chunk is persisted as a parquet under
 `~/.cache/upstox-historical/checkpoints/<job-hash>/chunk_NNNN.parquet`. The job hash is a stable SHA-256 of `(instrument_key, interval, from_date, to_date)`.
 
 If a fetch crashes, the next invocation with identical args:
@@ -553,25 +549,26 @@ If a fetch crashes, the next invocation with identical args:
 3. Only fetches the missing chunks
 4. On successful completion, wipes the checkpoint directory
 
-Uncompleted checkpoint directories can be manually cleared with `upstox-fetch cache clear-checkpoints`.
-
 ### Bhav Copy disk cache
 
-NSE Bhav Copies are immutable historical records — once a trading date's file exists, it never changes. We cache each parsed Bhav Copy as a parquet under
-`~/.cache/upstox-historical/bhav/YYYY-MM-DD.parquet`.
-
-Confirmed non-trading days (404 from NSE) get a zero-byte `.miss` marker so we don't re-hit NSE on weekends/holidays. This compounds: enriching 5 years of daily data goes from ~1,250 NSE requests to zero after the first run.
+Each parsed Bhav Copy is cached as a parquet under `~/.cache/upstox-historical/bhav/YYYY-MM-DD.parquet`. Confirmed non-trading days (404 from NSE) get a zero-byte `.miss` marker so we don't re-hit NSE on weekends/holidays. First enrichment of a date range is slow; subsequent enrichments of the same or overlapping ranges are near-instant.
 
 ### Rate limiting and retries
 
 The async client wraps every request in two layers:
 
-1. **`aiolimiter.AsyncLimiter(20, 1.0)`** — a token-bucket limiter: max 20 requests per second globally, regardless of concurrency.
+1. **`aiolimiter.AsyncLimiter(20, 1.0)`** — max 20 requests per second, globally.
 2. **`asyncio.Semaphore(5)`** — caps in-flight concurrency.
 
-Transient failures (5xx, 429, timeouts, connection errors) are retried via `tenacity` with exponential backoff (1s → 2s → 4s → 8s, capped at 30s, 5 attempts total). 401 is never retried — the token is bad and needs `upstox-fetch login`.
+Transient failures (5xx, 429, timeouts, connection errors) are retried via `tenacity` with exponential backoff (1s → 2s → 4s → 8s, capped at 30s, 5 attempts total). 401 is never retried — the token needs refreshing via `upstox-fetch login`.
 
-The sync client uses the same retry policy, sans the concurrency controls.
+### Column casing
+
+- **During processing** (in-memory DataFrames, API parsing, resampling, VWAP computation): lowercase `open, high, low, close, volume, vwap`. Matches Upstox API field names.
+- **At save time** (`_save` inside `fetcher.py`): capitalized — `Date, Open, High, Low, Close, Volume, VWAP`.
+- **Enrichment step** (`nse_enrichment._finalise_columns`): performs the same capitalization, so enriched output is pre-capitalized before `_save` sees it.
+
+This keeps internal processing simple while providing a consistent, conventional schema on disk.
 
 ### NSE Bhav Copy enrichment
 
@@ -582,7 +579,7 @@ Adds columns matching the `Sample.csv` layout:
 | Symbol | User-specified or derived from instrument_key |
 | Series | User-specified or derived from prefix (NSE_EQ → EQ) |
 | Prev Close | NSE Bhav Copy `PREV_CLOSE` |
-| Turnover | Computed locally: `vwap × volume` |
+| Turnover | Computed locally: `VWAP × Volume` |
 | Trades | NSE Bhav Copy `NO_OF_TRADES` |
 | Deliverable Volume | NSE Bhav Copy `DELIV_QTY` |
 | %Deliverble | NSE Bhav Copy `DELIV_PER` |
@@ -596,7 +593,6 @@ For intraday candles, day-level Bhav Copy values are broadcast to every intraday
 1. Open the project folder in PyCharm.
 2. **Settings → Python Interpreter → Add → Existing** → point to `.venv/bin/python`.
 3. (Optional) Add a `.env` plugin so PyCharm loads the vars for run configs.
-4. Create run configurations as needed — e.g. a "Module" config with module `upstox_historical.cli` and parameters `fetch "NSE_INDEX|Nifty 50" -i day`.
 
 ---
 
@@ -612,50 +608,92 @@ uv run mypy src/
 
 ## Upgrading from v1.0
 
-Drop-in upgrade — no code changes required. Your existing scripts using `HistoricalFetcher` continue to work unchanged.
+Drop-in upgrade. Your existing scripts using `HistoricalFetcher` continue to work.
 
 ```bash
 cd ~/upstox_historical
 git pull                             # if the new files are in the remote
-uv sync                              # pulls new deps (aiolimiter, tenacity, plotly, questionary, pyperclip, numpy)
+uv sync                              # pulls new deps
 uv run upstox-fetch --help           # should show 10 commands now
 ```
 
+**One behaviour change worth knowing about:** saved files now have capitalized OHLCV column names. If you have downstream code reading v1.0 files, the simplest fix is to lowercase on read:
+
+```python
+df = pd.read_parquet("your_file.parquet").rename(columns=str.lower)
+# now df has 'open', 'high', 'low', 'close' etc. as before
+```
+
+Validation, updater, and plotting are all case-insensitive, so they work transparently on files from either version.
+
 **New modules you can opt into at your own pace:**
 - Replace sync `HistoricalFetcher` calls with `AsyncHistoricalFetcher` wrapped in `asyncio.run()` for 5–10× speedup.
-- Add `upstox-fetch update` to your daily workflow to keep datasets current.
+- Add `upstox-fetch update` to your daily workflow.
 - Add `upstox-fetch validate` to catch data issues before they reach downstream consumers (e.g. SPDE calibration).
-
-If you've been calling `nse_enrichment.enrich()` directly, the API is unchanged — but the first call will now populate the disk cache, and subsequent calls for the same dates will be instant.
 
 ---
 
 ## Troubleshooting
 
-**`401 Unauthorised` on first request.** Your access token expired. Run `upstox-fetch login` to get a fresh one and update `.env`.
+**`401 Unauthorised` on first request.** Your access token expired. Run `upstox-fetch login` to get a fresh one.
 
-**`429 Rate limit exceeded` warnings in logs.** The retry layer is handling it. If you see it constantly, lower `rate_limit` in `AsyncUpstoxClient(...)` from 20 to 10 and try again.
+**`429 Rate limit exceeded` warnings in logs.** The retry layer is handling it. If you see it constantly, lower `rate_limit` in `AsyncUpstoxClient(...)` from 20 to 10.
 
-**Fetch hangs or runs slowly.** Set `--verbose` to see per-chunk progress. If it's chunk 5 of 120 stuck at "Fetching", it's likely rate-limit backoff — wait 30 seconds.
+**`Missing OHLC columns: ['close', 'high', 'low', 'open']`.** You're running an older `validation.py` that expects lowercase. Upgrade to v1.1.0 — validation is now case-insensitive.
 
-**Bhav Copy 404 for recent dates.** NSE publishes the Bhav Copy ~1 hour after market close. Dates before today-1 should always be available. If not, NSE's archive is temporarily down — retry later.
+**Fetch hangs or runs slowly.** Set `--verbose` to see per-chunk progress. If it's stuck at "Fetching", it's likely rate-limit backoff — wait 30 seconds.
 
-**Plotly chart shows no candles.** Check the DataFrame has `timestamp` or `Date` column, and `open`/`high`/`low`/`close` are numeric. Run `upstox-fetch validate` on the file first.
+**Bhav Copy 404 for recent dates.** NSE publishes the Bhav Copy ~1 hour after market close. Dates before today-1 should always be available.
 
-**Update rewrites with a different filename.** By design — the filename encodes the date range, so extending the range changes the name. Use `rename_output=False` in the Python API if you need stable filenames.
+**Plotly chart shows no candles.** Run `upstox-fetch validate` on the file first — the file may be empty or malformed.
 
-**Where are my cached files?**  
-`upstox-fetch cache stats` prints the location and contents.
+**Update rewrites with a different filename.** By design — the filename encodes the date range, so extending the range changes the name. Use `rename_output=False` in the Python API for stable filenames.
+
+**Where are my cached files?** `upstox-fetch cache stats` prints the location.
 
 ---
 
 ## Rate limits and caveats
 
 - Historical candles: Upstox allows bursty short-term traffic but aggressive sustained load gets 429. The built-in rate limiter (20 req/s) is conservative; raise it if your tier allows more.
-- Access tokens expire **daily** at ~3:30 AM IST. Automate `upstox-fetch login` or re-run manually each morning.
-- 1-minute data is available for the **last ~2 years**. Longer ranges return a partial result.
+- Access tokens expire **daily** at ~3:30 AM IST. Automate `upstox-fetch login` or re-run each morning.
+- 1-minute data is available for the **last ~2 years**. Longer ranges return partial results.
 - Daily/weekly/monthly data goes much further back (varies by instrument).
-- NSE Bhav Copy rate: NSE's archive is bot-sensitive. The client adds a 1-second delay between live Bhav Copy fetches, but once cached it's instant.
+- NSE Bhav Copy rate: NSE's archive is bot-sensitive. The client adds a 1-second delay between live Bhav Copy fetches; once cached, it's instant.
+
+---
+
+## Changelog
+
+### v1.1.0 (Apr 18, 2026)
+
+**New features:**
+- Async concurrent fetcher (`AsyncHistoricalFetcher`) with `aiolimiter` rate limiting and `asyncio.Semaphore`-based concurrency cap
+- Checkpoint resume for interrupted fetches (per-chunk parquet cache)
+- Incremental `update` command — fetch only what's missing since the last timestamp
+- Multi-instrument `batch` command — fetch many tickers concurrently through a shared rate limiter
+- `plot` command with Plotly candlestick charts + SMA/EMA/Bollinger/RSI/MACD/VWAP overlays
+- `validate` command with OHLC sanity, gap detection, outlier detection (case-insensitive)
+- `find` command — interactive instrument search with clipboard copy
+- `cache` command — inspect and clear Bhav Copy / checkpoint caches
+- Tenacity retries on transient HTTP errors (5xx, 429, network)
+- Disk-cached NSE Bhav Copy with `.miss` markers for non-trading days
+- Two-stage Rich progress bars (chunks + NSE enrichment)
+
+**Behaviour changes:**
+- Output files now use capitalized column names: `Date, Open, High, Low, Close, Volume, VWAP` (plus the existing capitalized NSE columns when enriched)
+- httpx per-URL request logs suppressed at INFO level; re-enabled with `--verbose`
+- Saved filename still encodes date range; `update` renames file when extending the range
+
+**Backward compatibility:**
+- Sync `HistoricalFetcher` interface unchanged — all v1.0 scripts work
+- Validation, plotting, and updater modules handle both lowercase (v1.0) and capitalized (v1.1) column names transparently
+
+### v1.0.0 (earlier)
+
+- Data fetch only: OHLCV + NSE Bhav Copy enrichment
+- Sync fetcher with auto-chunking
+- CLI: fetch, intraday, login, keys
 
 ---
 

@@ -115,9 +115,18 @@ def load_candles(path: str | Path) -> pd.DataFrame:
     else:
         raise ValueError(f"Unsupported extension: {path.suffix} (expected .csv or .parquet)")
 
-    # Normalise timestamp column name
-    if "Date" in df.columns and "timestamp" not in df.columns:
-        df = df.rename(columns={"Date": "timestamp"})
+    # Normalise column names: map any case-variant of OHLCV/timestamp to lowercase
+    # so the rest of the plotting code can use a single set of names.
+    rename_map = {}
+    for actual in df.columns:
+        lower = actual.lower()
+        if lower in {"timestamp", "date", "open", "high", "low", "close",
+                     "volume", "vwap"}:
+            target = "timestamp" if lower == "date" else lower
+            if actual != target:
+                rename_map[actual] = target
+    if rename_map:
+        df = df.rename(columns=rename_map)
 
     if "timestamp" not in df.columns:
         raise ValueError(f"No 'timestamp' or 'Date' column in {path}")
@@ -173,8 +182,17 @@ def plot_candles(
         source_path = Path(source)
     else:
         df = source.copy()
-        if "Date" in df.columns and "timestamp" not in df.columns:
-            df = df.rename(columns={"Date": "timestamp"})
+        # Normalise OHLCV/timestamp column casing for a directly-passed DataFrame too
+        rename_map = {}
+        for actual in df.columns:
+            lower = actual.lower()
+            if lower in {"timestamp", "date", "open", "high", "low", "close",
+                         "volume", "vwap"}:
+                target = "timestamp" if lower == "date" else lower
+                if actual != target:
+                    rename_map[actual] = target
+        if rename_map:
+            df = df.rename(columns=rename_map)
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         source_path = Path("candles")
 

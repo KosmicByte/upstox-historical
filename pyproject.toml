@@ -1,6 +1,6 @@
 [project]
 name = "upstox-historical"
-version = "0.2.0"
+version = "1.1.0"
 description = "Fetch, update, chart, and validate historical OHLCV data from Upstox API v2"
 authors = [{ name = "Aditya Mishra" }]
 readme = "README.md"

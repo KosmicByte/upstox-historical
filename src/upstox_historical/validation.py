@@ -129,12 +129,12 @@ def validate(
     report.timestamp_col = ts
 
     # ── OHLC ordering ────────────────────────────────────────────────
-    required = {"open", "high", "low", "close"}
+    required = {"Open", "High", "Low", "Close"}
     missing_cols = required - set(df.columns)
     if missing_cols:
         report.errors.append(f"Missing OHLC columns: {sorted(missing_cols)}")
     else:
-        o, h, l, c = df["open"], df["high"], df["low"], df["close"]
+        o, h, l, c = df["Open"], df["High"], df["Low"], df["Close"]
         bad = ~(
             (h >= o)
             & (h >= c)
@@ -151,9 +151,9 @@ def validate(
             )
 
     # ── Volume sanity ────────────────────────────────────────────────
-    if "volume" in df.columns:
-        negatives = int((df["volume"] < 0).sum())
-        zeros = int((df["volume"] == 0).sum())
+    if "Volume" in df.columns:
+        negatives = int((df["Volume"] < 0).sum())
+        zeros = int((df["Volume"] == 0).sum())
         report.negative_volume_rows = negatives
         report.zero_volume_rows = zeros
         if negatives > 0:
@@ -197,8 +197,8 @@ def validate(
                     )
 
     # ── Outlier detection on log returns ─────────────────────────────
-    if "close" in df.columns and len(df) >= 30:
-        close = df["close"].astype(float)
+    if "Close" in df.columns and len(df) >= 30:
+        close = df["Close"].astype(float)
         log_ret = np.log(close / close.shift(1))
         rolling_std = log_ret.rolling(window=30, min_periods=10).std()
         with np.errstate(invalid="ignore"):
@@ -296,8 +296,8 @@ def repair(df: pd.DataFrame, *, drop_duplicates: bool = True, sort: bool = True)
     if sort:
         df = df.sort_values(ts).reset_index(drop=True)
 
-    if {"open", "high", "low", "close"}.issubset(df.columns):
-        o, h, l, c = df["open"], df["high"], df["low"], df["close"]
+    if {"Open", "High", "Low", "Close"}.issubset(df.columns):
+        o, h, l, c = df["Open"], df["High"], df["Low"], df["Close"]
         ok = (h >= o) & (h >= c) & (l <= o) & (l <= c) & (l >= 0)
         df = df.loc[ok].reset_index(drop=True)
 
