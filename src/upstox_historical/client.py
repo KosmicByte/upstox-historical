@@ -1,18 +1,19 @@
 """
-client.py — thin httpx wrapper around the Upstox v2 REST API.
+client.py — httpx wrapper around the Upstox v2 and v3 REST APIs.
 
-Synchronous client. For high-throughput fetches (many chunks or many
-instruments), prefer :class:`upstox_historical.async_client.AsyncUpstoxClient`
-which does concurrency + rate limiting natively.
+Two clients are provided:
 
-Resilience
-----------
-All requests are wrapped in a tenacity retry decorator that:
+  UpstoxClient   — v2 REST (historical candles, intraday).
+                   Uses access_token or analytics_token.
 
-- Retries up to 5 times on 5xx, 429, and connection errors.
-- Uses exponential backoff (1s, 2s, 4s, 8s, ...capped at 30s).
-- Does NOT retry on 401 (auth fails — user must re-run OAuth).
-- Does NOT retry on 4xx other than 429.
+  UpstoxClientV3 — v3 REST (LTP quotes, OHLC quotes, market status,
+                   WebSocket authorize URL). Prefers analytics_token.
+                   This is what stream.py and market_info.py use.
+
+Token priority (both clients)
+------------------------------
+analytics_token is preferred when available (1-year validity).
+Falls back to access_token (daily OAuth) automatically via best_token().
 """
 from __future__ import annotations
 
@@ -20,24 +21,18 @@ import logging
 from typing import Any
 
 import httpx
-from tenacity import (
-    before_sleep_log,
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
 from upstox_historical.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT = 30.0
-_DEFAULT_RETRY_ATTEMPTS = 5
+_DEFAULT_TIMEOUT = 30.0  # seconds
 
+
+# ── Exceptions ────────────────────────────────────────────────────────
 
 class UpstoxAuthError(Exception):
-    """Raised when the access token is missing or rejected by Upstox."""
+    """Raised when the token is missing or rejected by Upstox."""
 
 
 class UpstoxAPIError(Exception):
@@ -48,57 +43,60 @@ class UpstoxAPIError(Exception):
         super().__init__(f"HTTP {status_code}: {message}")
 
 
-class _TransientHTTPError(Exception):
-    """Internal marker exception used to trigger retries on 5xx/429."""
+# ── Shared helpers ────────────────────────────────────────────────────
+
+def _raise_for_status(response: httpx.Response) -> None:
+    if response.status_code == 401:
+        raise UpstoxAuthError(
+            "401 Unauthorised — token is invalid or expired. "
+            "For market data APIs use UPSTOX_ANALYTICS_TOKEN (1-year). "
+            "For order/portfolio APIs use UPSTOX_ACCESS_TOKEN (daily OAuth)."
+        )
+    if response.status_code == 429:
+        raise UpstoxAPIError(429, "Rate limit exceeded. Slow down requests.")
+    if response.is_error:
+        try:
+            msg = response.json().get("errors", [{}])[0].get("message", response.text)
+        except Exception:
+            msg = response.text
+        raise UpstoxAPIError(response.status_code, msg)
 
 
-# Exceptions we retry on (transient network/server issues)
-_RETRYABLE_EXCEPTIONS = (
-    httpx.TimeoutException,
-    httpx.ConnectError,
-    httpx.RemoteProtocolError,
-    _TransientHTTPError,
-)
-
+# ── v2 Client ─────────────────────────────────────────────────────────
 
 class UpstoxClient:
     """
-    Synchronous HTTP client for the Upstox v2 API with retries.
+    Synchronous HTTP client for the Upstox **v2** API.
+
+    Handles historical candles and intraday candles.
+    Prefers analytics_token when available; falls back to access_token.
 
     Usage::
 
-        from upstox_historical.client import UpstoxClient
-
-        client = UpstoxClient()                  # reads token from .env
-        client = UpstoxClient(access_token="…")  # explicit token
+        client = UpstoxClient()                   # reads token from .env
+        client = UpstoxClient(token="<token>")    # explicit token
     """
 
     def __init__(
         self,
+        token: str | None = None,
+        # kept for backward compat — old callers passed access_token=
         access_token: str | None = None,
         settings: Settings | None = None,
         timeout: float = _DEFAULT_TIMEOUT,
-        retry_attempts: int = _DEFAULT_RETRY_ATTEMPTS,
     ) -> None:
         self._settings = settings or get_settings()
-        self._token = access_token or self._settings.access_token
+        self._token = token or access_token or self._settings.best_token()
 
-        if not self._token:
-            raise UpstoxAuthError(
-                "No access token found. Set UPSTOX_ACCESS_TOKEN in your .env file "
-                "or pass access_token= explicitly. See README for OAuth flow."
-            )
-
-        self._base_url = self._settings.base_url
         self._http = httpx.Client(
-            base_url=self._base_url,
+            base_url=self._settings.base_url,
             headers=self._build_headers(),
             timeout=timeout,
         )
-        self._retry_attempts = retry_attempts
-        logger.debug("UpstoxClient initialised (base_url=%s)", self._base_url)
-
-    # ── private ──────────────────────────────────────────
+        logger.debug(
+            "UpstoxClient (v2) initialised | analytics=%s",
+            self._settings.has_analytics_token(),
+        )
 
     def _build_headers(self) -> dict[str, str]:
         return {
@@ -108,24 +106,12 @@ class UpstoxClient:
         }
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        # We construct the retry decorator at call time so `retry_attempts`
-        # can be configured per-instance.
-        decorated = retry(
-            stop=stop_after_attempt(self._retry_attempts),
-            wait=wait_exponential(multiplier=1, min=1, max=30),
-            retry=retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
-            before_sleep=before_sleep_log(logger, logging.WARNING),
-            reraise=True,
-        )(self._get_once)
-        return decorated(path, params)
-
-    def _get_once(self, path: str, params: dict[str, Any] | None) -> dict[str, Any]:
         logger.debug("GET %s  params=%s", path, params)
         response = self._http.get(path, params=params)
         _raise_for_status(response)
         return response.json()  # type: ignore[return-value]
 
-    # ── public API ────────────────────────────────────────
+    # ── Historical data ───────────────────────────────────────────────
 
     def get_historical_candles(
         self,
@@ -135,18 +121,16 @@ class UpstoxClient:
         to_date: str,
     ) -> dict[str, Any]:
         """
-        Fetch historical OHLCV candles.
+        Fetch historical OHLCV candles (v2).
 
         Parameters
         ----------
         instrument_key : str
-            e.g. ``"NSE_INDEX|Nifty 50"`` or ``"NSE_EQ|INE009A01021"``
+            e.g. ``"NSE_INDEX|Nifty 50"``
         interval : str
-            One of ``1minute``, ``30minute``, ``day``, ``week``, ``month``
-        from_date : str
-            Start date ``YYYY-MM-DD``
-        to_date : str
-            End date   ``YYYY-MM-DD``
+            ``1minute`` | ``30minute`` | ``day`` | ``week`` | ``month``
+        from_date, to_date : str
+            ``YYYY-MM-DD``
         """
         path = f"/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
         return self._get(path)
@@ -156,34 +140,16 @@ class UpstoxClient:
         instrument_key: str,
         interval: str,
     ) -> dict[str, Any]:
-        """
-        Fetch today's intraday OHLCV candles (no date range needed).
-
-        Parameters
-        ----------
-        instrument_key : str
-            e.g. ``"NSE_INDEX|Nifty 50"``
-        interval : str
-            ``1minute`` or ``30minute``
-        """
+        """Fetch today's intraday OHLCV candles (v2, no date range needed)."""
         path = f"/historical-candle/intraday/{instrument_key}/{interval}"
         return self._get(path)
 
     def search_instruments(self, query: str) -> dict[str, Any]:
-        """Search for instruments by name / trading symbol."""
+        """Search instruments by name / trading symbol."""
         return self._get("/instruments/search", params={"q": query})
-
-    def get_market_quote(self, instrument_keys: list[str]) -> dict[str, Any]:
-        """Fetch live LTP quote for one or more instruments."""
-        return self._get(
-            "/market-quote/ltp",
-            params={"instrument_key": ",".join(instrument_keys)},
-        )
 
     def close(self) -> None:
         self._http.close()
-
-    # ── context manager ───────────────────────────────────
 
     def __enter__(self) -> "UpstoxClient":
         return self
@@ -192,32 +158,154 @@ class UpstoxClient:
         self.close()
 
 
-# ── module-level helpers ─────────────────────────────────────────────
+# ── v3 Client ─────────────────────────────────────────────────────────
 
-def _raise_for_status(response: httpx.Response) -> None:
+class UpstoxClientV3:
     """
-    Map an httpx Response to our exception hierarchy.
+    Synchronous HTTP client for the Upstox **v3** API.
 
-    401 → UpstoxAuthError (NOT retried)
-    429 → _TransientHTTPError (retried with backoff)
-    5xx → _TransientHTTPError (retried with backoff)
-    other → UpstoxAPIError (NOT retried)
+    Covers:
+      - LTP quotes (up to 500 instruments per call)
+      - OHLC quotes (up to 500 instruments per call)
+      - Full market quotes
+      - Market information / exchange status
+      - WebSocket authorize URL (required before opening a live stream)
+
+    All endpoints here work with the Analytics Token (1-year).
+    No daily OAuth renewal needed for any of these.
+
+    Usage::
+
+        client = UpstoxClientV3()                 # reads token from .env
+        client = UpstoxClientV3(token="<token>")  # explicit token
     """
-    sc = response.status_code
-    if sc == 401:
-        raise UpstoxAuthError(
-            "401 Unauthorised — your access token is invalid or expired. "
-            "Re-run: uv run upstox-fetch login"
+
+    def __init__(
+        self,
+        token: str | None = None,
+        settings: Settings | None = None,
+        timeout: float = _DEFAULT_TIMEOUT,
+    ) -> None:
+        self._settings = settings or get_settings()
+        self._token = token or self._settings.best_token()
+
+        self._http = httpx.Client(
+            base_url=self._settings.base_url_v3,
+            headers=self._build_headers(),
+            timeout=timeout,
         )
-    if sc == 429:
-        logger.warning("429 rate-limit from Upstox — backing off and retrying")
-        raise _TransientHTTPError("429 rate-limited")
-    if 500 <= sc < 600:
-        logger.warning("%d server error from Upstox — retrying", sc)
-        raise _TransientHTTPError(f"{sc} server error")
-    if response.is_error:
+        logger.debug(
+            "UpstoxClientV3 initialised | analytics=%s",
+            self._settings.has_analytics_token(),
+        )
+
+    def _build_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._token}",
+            "Accept": "application/json",
+            "Api-Version": "2.0",
+        }
+
+    def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        logger.debug("GET v3 %s  params=%s", path, params)
+        response = self._http.get(path, params=params)
+        _raise_for_status(response)
+        return response.json()  # type: ignore[return-value]
+
+    # ── Market quotes ─────────────────────────────────────────────────
+
+    def get_ltp(self, instrument_keys: list[str]) -> dict[str, Any]:
+        """
+        Fetch Last Traded Price for up to 500 instruments (v3).
+
+        Returns raw API response. Use market_info.get_ltp() for a clean scalar.
+
+        Parameters
+        ----------
+        instrument_keys : list[str]
+            e.g. ``["NSE_INDEX|Nifty 50", "NSE_EQ|INE002A01018"]``
+        """
+        return self._get(
+            "/market-quote/ltp",
+            params={"instrument_key": ",".join(instrument_keys)},
+        )
+
+    def get_ohlc(self, instrument_keys: list[str], interval: str = "1d") -> dict[str, Any]:
+        """
+        Fetch OHLC quotes for up to 500 instruments (v3).
+
+        Parameters
+        ----------
+        instrument_keys : list[str]
+        interval : str
+            ``1d`` (default) | ``1week`` | ``1month``
+        """
+        return self._get(
+            "/market-quote/ohlc",
+            params={
+                "instrument_key": ",".join(instrument_keys),
+                "interval": interval,
+            },
+        )
+
+    def get_full_quote(self, instrument_keys: list[str]) -> dict[str, Any]:
+        """
+        Fetch full market quotes (OHLC + bid/ask depth + volume + OI) for
+        up to 500 instruments (v3).
+        """
+        return self._get(
+            "/market-quote/quotes",
+            params={"instrument_key": ",".join(instrument_keys)},
+        )
+
+    # ── Market information ────────────────────────────────────────────
+
+    def get_market_status(self) -> dict[str, Any]:
+        """
+        Fetch the current status of all exchange segments.
+
+        Returns a dict like::
+
+            {
+                "NSE_EQ": "NORMAL_OPEN",
+                "NSE_FO": "NORMAL_OPEN",
+                "NSE_INDEX": "NORMAL_OPEN",
+                ...
+            }
+        """
+        return self._get("/market-quote/status")
+
+    def get_exchange_status(self) -> dict[str, Any]:
+        """Fetch exchange-level market status (open / closed / pre-open)."""
+        return self._get("/market/status")
+
+    # ── WebSocket ─────────────────────────────────────────────────────
+
+    def get_ws_authorize_url(self) -> str:
+        """
+        Fetch the one-time authorized ``wss://`` URL for Market Data Feed V3.
+
+        This URL is single-use (the embedded code expires after one connection).
+        Call this immediately before opening the WebSocket — do not cache it.
+
+        Returns
+        -------
+        str
+            A ``wss://`` URL ready to pass to a WebSocket client.
+        """
+        data = self._get("/feed/market-data-feed/authorize")
         try:
-            msg = response.json().get("errors", [{}])[0].get("message", response.text)
-        except Exception:
-            msg = response.text
-        raise UpstoxAPIError(sc, msg)
+            return data["data"]["authorized_redirect_uri"]  # type: ignore[return-value]
+        except (KeyError, TypeError) as exc:
+            raise UpstoxAPIError(200, f"Unexpected authorize response: {data}") from exc
+
+    # ── Cleanup ───────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        self._http.close()
+
+    def __enter__(self) -> "UpstoxClientV3":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
