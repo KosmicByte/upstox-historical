@@ -29,6 +29,8 @@ dependencies = [
     "pyperclip>=1.8.2",
     # Plotting
     "plotly>=5.24.0",
+    "websockets>=16.0",
+    "protobuf>=7.35.0",
 ]
 
 [project.optional-dependencies]
