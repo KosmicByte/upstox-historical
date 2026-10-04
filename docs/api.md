@@ -1,12 +1,8 @@
 # Python API
 
-Use `upstox-historical` directly from your code instead of the CLI. Same engine, more control.
-
----
-
 ## Sync fetcher
 
-Identical to v1.0. **Note:** the in-memory DataFrame returned by `fetch()` still has lowercase OHLCV column names — capitalization happens only at save time.
+`fetch()` returns lowercase OHLCV columns. Columns are capitalized on save only.
 
 ```python
 from upstox_historical.fetcher import HistoricalFetcher
@@ -20,8 +16,7 @@ df = fetcher.fetch(
     interval=Interval.D1,
     from_date="2024-01-01",
     to_date="2024-12-31",
-)
-print(df.tail())                     # lowercase columns
+)                                    # lowercase columns
 
 path = fetcher.fetch_and_save(
     instrument_key=NSE.NIFTY_50,
@@ -29,14 +24,12 @@ path = fetcher.fetch_and_save(
     from_date="2024-01-01",
     to_date="2024-12-31",
     fmt="parquet",
-)                                    # file has capitalized columns
+)                                    # capitalized columns
 ```
 
----
+## Async fetcher
 
-## Async fetcher (recommended)
-
-For anything longer than a single chunk, use the async fetcher. It's concurrent, resumable, and mostly a drop-in API change.
+Concurrent and resumable. Recommended for multi-chunk ranges.
 
 ```python
 import asyncio
@@ -53,14 +46,11 @@ async def main():
         nse_enrich=True,
         symbol="RELIANCE",
     )
-    print(df.shape)
 
 asyncio.run(main())
 ```
 
----
-
-## Multi-instrument batch
+## Batch
 
 ```python
 import asyncio
@@ -81,45 +71,36 @@ async def main():
             NSE.INFY: "INFY",
             NSE.HDFC_BANK: "HDFCBANK",
         },
-    )
-    for key, df in results.items():
-        print(f"{key}: {len(df)} rows")
+    )                                # dict: instrument_key -> DataFrame
 
 asyncio.run(main())
 ```
 
----
-
-## Incremental updates
+## Incremental update
 
 ```python
 import asyncio
 from upstox_historical.updater import plan_update, update
 
-plan = plan_update("./data/NSE_EQ_INE002A01018_day_2020-01-01_2025-03-31.parquet")
-print(f"Need to fetch {plan.new_from} to {plan.new_to}")
+path = "./data/NSE_EQ_INE002A01018_day_2020-01-01_2025-03-31.parquet"
 
-result = asyncio.run(update("./data/NSE_EQ_INE002A01018_day_2020-01-01_2025-03-31.parquet"))
-print(f"Updated to {result.path}")
+plan = plan_update(path)             # plan.new_from, plan.new_to
+result = asyncio.run(update(path))   # result.path
 ```
-
----
 
 ## Validation
 
 ```python
 from upstox_historical.validation import validate, repair
 
-report = validate(df)                # accepts any column casing
+report = validate(df)                # any column casing
 print(report.summary())
 
 if report.errors:
-    df = repair(df)                  # best-effort cleanup
+    df = repair(df)                  # best-effort
 ```
 
-`ValidationReport` exposes structured fields: `errors`, `warnings`, `ohlc_violations`, `zero_volume_rows`, `missing_trading_days`, `outlier_rows`, etc.
-
----
+`ValidationReport` fields: `errors`, `warnings`, `ohlc_violations`, `zero_volume_rows`, `missing_trading_days`, `outlier_rows`.
 
 ## Charting
 
@@ -134,10 +115,3 @@ path = plot_candles(
     open_browser=True,
 )
 ```
-
----
-
-## See also
-
-- [CLI reference](./cli.md) — same operations from the command line
-- [Design](./design.md) — what's happening under the hood (chunking, checkpoints, rate limiting)
