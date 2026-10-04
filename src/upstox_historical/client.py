@@ -260,24 +260,37 @@ class UpstoxClientV3:
 
     # ── Market information ────────────────────────────────────────────
 
-    def get_market_status(self) -> dict[str, Any]:
+    def get_market_status(self, exchange: str = "NSE") -> dict[str, Any]:
         """
-        Fetch the current status of all exchange segments.
+        Fetch the current trading status for a single exchange.
 
-        Returns a dict like::
+        Uses the v2 endpoint ``/v2/market/status/{exchange}`` — there is no v3
+        variant. Called via an absolute URL because this client's base_url is v3.
 
-            {
-                "NSE_EQ": "NORMAL_OPEN",
-                "NSE_FO": "NORMAL_OPEN",
-                "NSE_INDEX": "NORMAL_OPEN",
-                ...
-            }
+        Parameters
+        ----------
+        exchange : str
+            Exchange code: NSE | BSE | NFO | MCX | CDS | BFO | BCD. Default "NSE".
+
+        Returns
+        -------
+        dict
+            API response, e.g.::
+
+                {"status": "success",
+                 "data": {"exchange": "NSE",
+                          "status": "NORMAL_OPEN",
+                          "last_updated": 1705549500000}}
         """
-        return self._get("/market-quote/status")
+        url = f"https://api.upstox.com/v2/market/status/{exchange}"
+        logger.debug("GET %s", url)
+        response = self._http.get(url)
+        _raise_for_status(response)
+        return response.json()  # type: ignore[return-value]
 
-    def get_exchange_status(self) -> dict[str, Any]:
-        """Fetch exchange-level market status (open / closed / pre-open)."""
-        return self._get("/market/status")
+    def get_exchange_status(self, exchange: str = "NSE") -> dict[str, Any]:
+        """Alias for get_market_status(). Fetches status for one exchange."""
+        return self.get_market_status(exchange)
 
     # ── WebSocket ─────────────────────────────────────────────────────
 

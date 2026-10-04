@@ -185,68 +185,74 @@ def get_ohlc(
 
 def get_market_status_all(
     *,
+    exchanges: list[str] | None = None,
     token: str | None = None,
 ) -> list[MarketStatus]:
     """
-    Return the open/close status of all exchange segments.
+    Return the open/close status for a set of exchanges.
+
+    The Upstox endpoint returns one exchange per call (``/v2/market/status/{exchange}``),
+    so this queries each requested exchange and collects the results.
+
+    Parameters
+    ----------
+    exchanges : list[str], optional
+        Exchange codes to query. Defaults to ["NSE", "BSE", "NFO", "MCX"].
+    token : str, optional
 
     Returns
     -------
     list[MarketStatus]
-        One entry per segment (NSE_EQ, NSE_FO, NSE_INDEX, BSE_EQ, ...).
+        One entry per exchange queried.
 
     Example
     -------
     >>> statuses = get_market_status_all()
     >>> for s in statuses:
     ...     print(s.segment, s.status, s.is_open)
-    NSE_EQ NORMAL_OPEN True
-    NSE_FO NORMAL_OPEN True
+    NSE NORMAL_OPEN True
+    BSE NORMAL_OPEN True
     """
+    exchanges = exchanges or ["NSE", "BSE", "NFO", "MCX"]
     settings = get_settings()
-    with UpstoxClientV3(token=token, settings=settings) as client:
-        raw = client.get_exchange_status()
-
-    # Response shape varies — handle both list and dict forms
-    data = raw.get("data", raw)
-
     results: list[MarketStatus] = []
-    if isinstance(data, list):
-        for item in data:
-            results.append(MarketStatus(
-                segment=item.get("exchange", item.get("segment", "UNKNOWN")),
-                status=item.get("market_status", item.get("status", "UNKNOWN")),
-            ))
-    elif isinstance(data, dict):
-        for segment, status in data.items():
-            if isinstance(status, str):
-                results.append(MarketStatus(segment=segment, status=status))
-            elif isinstance(status, dict):
+
+    with UpstoxClientV3(token=token, settings=settings) as client:
+        for exch in exchanges:
+            try:
+                raw = client.get_market_status(exch)
+            except Exception as exc:  # one bad exchange shouldn't sink the rest
+                logger.warning("Market status fetch failed for %s: %s", exch, exc)
+                continue
+            # Response: {"status": "success", "data": {"exchange": "NSE",
+            #            "status": "NORMAL_OPEN", "last_updated": ...}}
+            data = raw.get("data", {})
+            if isinstance(data, dict) and data:
                 results.append(MarketStatus(
-                    segment=segment,
-                    status=status.get("market_status", status.get("status", "UNKNOWN")),
+                    segment=data.get("exchange", exch),
+                    status=data.get("status", "UNKNOWN"),
                 ))
 
-    logger.debug("Market status: %d segments", len(results))
+    logger.debug("Market status: %d exchanges", len(results))
     return results
 
 
 def is_market_open(
-    segment: str = "NSE_EQ",
+    exchange: str = "NSE",
     *,
     token: str | None = None,
 ) -> bool:
     """
-    Return True when the given exchange segment is open for trading.
+    Return True when the given exchange is open for trading.
 
     This is the primary gate check used by the pipeline before any
     live data fetch or WebSocket operation.
 
     Parameters
     ----------
-    segment : str
-        Exchange segment to check. Default: ``"NSE_EQ"``.
-        Common values: ``"NSE_EQ"`` | ``"NSE_FO"`` | ``"NSE_INDEX"``
+    exchange : str
+        Exchange code to check. Default: ``"NSE"``.
+        Common values: ``"NSE"`` | ``"BSE"`` | ``"NFO"`` | ``"MCX"``
     token : str, optional
 
     Returns
@@ -258,18 +264,19 @@ def is_market_open(
     >>> if is_market_open():
     ...     price = get_ltp("NSE_INDEX|Nifty 50")
     """
-    statuses = get_market_status_all(token=token)
+    settings = get_settings()
+    with UpstoxClientV3(token=token, settings=settings) as client:
+        try:
+            raw = client.get_market_status(exchange)
+        except Exception as exc:
+            logger.warning("Market status check failed for %s: %s", exchange, exc)
+            return False
 
-    for s in statuses:
-        if s.segment.upper() == segment.upper():
-            logger.debug("Segment %s status=%s open=%s", s.segment, s.status, s.is_open)
-            return s.is_open
-
-    # Segment not found in response — log a warning and assume closed (safe default)
-    logger.warning(
-        "Segment '%s' not found in market status response. Assuming closed.", segment
-    )
-    return False
+    data = raw.get("data", {})
+    status = data.get("status", "") if isinstance(data, dict) else ""
+    is_open = "OPEN" in status.upper()
+    logger.debug("Exchange %s status=%s open=%s", exchange, status, is_open)
+    return is_open
 
 
 def get_ws_authorize_url(*, token: str | None = None) -> str:
