@@ -23,19 +23,19 @@ uv run upstox-fetch fetch "NSE_INDEX|Nifty 50" \
 
 **Options:**
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--interval` `-i` | `day` | Candle interval (see [intervals](#supported-intervals)) |
-| `--from` `-f` | `2024-01-01` | Start date YYYY-MM-DD |
-| `--to` `-t` | `2024-12-31` | End date YYYY-MM-DD |
-| `--out-dir` `-o` | `./data` | Output directory |
-| `--format` | `parquet` | `csv` or `parquet` |
-| `--sync` | off | Use the sync fetcher (for debugging) |
-| `--nse-enrich` | off | Add NSE Bhav Copy columns |
-| `--symbol` `-s` | auto | NSE ticker for enrichment (e.g. `RELIANCE`) |
-| `--series` | auto | NSE series for enrichment (e.g. `EQ`) |
-| `--preview/--no-preview` | preview | Print first 10 rows after fetch |
-| `--validate/--no-validate` | validate | Run quality checks after fetch |
+| Flag                       | Default      | Description                                             |
+|----------------------------|--------------|---------------------------------------------------------|
+| `--interval` `-i`          | `day`        | Candle interval (see [intervals](#supported-intervals)) |
+| `--from` `-f`              | `2024-01-01` | Start date YYYY-MM-DD                                   |
+| `--to` `-t`                | `2024-12-31` | End date YYYY-MM-DD                                     |
+| `--out-dir` `-o`           | `./data`     | Output directory                                        |
+| `--format`                 | `parquet`    | `csv` or `parquet`                                      |
+| `--sync`                   | off          | Use the sync fetcher (for debugging)                    |
+| `--nse-enrich`             | off          | Add NSE Bhav Copy columns                               |
+| `--symbol` `-s`            | auto         | NSE ticker for enrichment (e.g. `RELIANCE`)             |
+| `--series`                 | auto         | NSE series for enrichment (e.g. `EQ`)                   |
+| `--preview/--no-preview`   | preview      | Print first 10 rows after fetch                         |
+| `--validate/--no-validate` | validate     | Run quality checks after fetch                          |
 
 **NSE-enriched fetch for Reliance:**
 
@@ -110,14 +110,14 @@ uv run upstox-fetch plot ./data/reliance.parquet \
 
 **Available indicators** (comma-separated):
 
-| Spec | Meaning |
-|------|---------|
-| `sma20`, `sma50`, `sma200` | Simple moving average, N periods |
-| `ema12`, `ema26` | Exponential moving average, N periods |
-| `bb20` | Bollinger Bands (SMA ± 2σ over N periods) |
-| `rsi14` | Relative Strength Index over N periods (subplot) |
-| `macd` | MACD (12, 26, 9) with signal + histogram (subplot) |
-| `vwap_overlay` | Overlay the `VWAP` column if present |
+| Spec                       | Meaning                                            |
+|----------------------------|----------------------------------------------------|
+| `sma20`, `sma50`, `sma200` | Simple moving average, N periods                   |
+| `ema12`, `ema26`           | Exponential moving average, N periods              |
+| `bb20`                     | Bollinger Bands (SMA ± 2σ over N periods)          |
+| `rsi14`                    | Relative Strength Index over N periods (subplot)   |
+| `macd`                     | MACD (12, 26, 9) with signal + histogram (subplot) |
+| `vwap_overlay`             | Overlay the `VWAP` column if present               |
 
 Output defaults to `<filename>.html` next to the source.
 
@@ -183,9 +183,9 @@ uv run upstox-fetch keys                   # list built-in NSE instrument keys
 
 ## Supported intervals
 
-| Flag value | Native? | Description |
-|------------|---------|-------------|
-| `1minute`  | native  | 1-minute candle |
+| Flag value | Native?   | Description      |
+|------------|-----------|------------------|
+| `1minute`  | native    | 1-minute candle  |
 | `2minute`  | resampled | built from 1-min |
 | `3minute`  | resampled | built from 1-min |
 | `5minute`  | resampled | built from 1-min |
@@ -193,10 +193,10 @@ uv run upstox-fetch keys                   # list built-in NSE instrument keys
 | `15minute` | resampled | built from 1-min |
 | `20minute` | resampled | built from 1-min |
 | `25minute` | resampled | built from 1-min |
-| `30minute` | native  | 30-minute candle |
-| `day`      | native  | daily (default) |
-| `week`     | native  | weekly |
-| `month`    | native  | monthly |
+| `30minute` | native    | 30-minute candle |
+| `day`      | native    | daily (default)  |
+| `week`     | native    | weekly           |
+| `month`    | native    | monthly          |
 
 ---
 
@@ -204,13 +204,13 @@ uv run upstox-fetch keys                   # list built-in NSE instrument keys
 
 Access via `upstox_historical.instruments.NSE.*`:
 
-| Constant | Instrument key |
-|----------|----------------|
-| `NSE.NIFTY_50`  | `NSE_INDEX\|Nifty 50` |
-| `NSE.BANKNIFTY` | `NSE_INDEX\|Nifty Bank` |
+| Constant        | Instrument key                 |
+|-----------------|--------------------------------|
+| `NSE.NIFTY_50`  | `NSE_INDEX\|Nifty 50`          |
+| `NSE.BANKNIFTY` | `NSE_INDEX\|Nifty Bank`        |
 | `NSE.FINNIFTY`  | `NSE_INDEX\|Nifty Fin Service` |
-| `NSE.INDIA_VIX` | `NSE_INDEX\|India VIX` |
-| `NSE.RELIANCE`  | `NSE_EQ\|INE002A01018` |
-| `NSE.TCS`       | `NSE_EQ\|INE467B01029` |
-| `NSE.INFY`      | `NSE_EQ\|INE009A01021` |
-| … and more      | run `upstox-fetch keys` |
+| `NSE.INDIA_VIX` | `NSE_INDEX\|India VIX`         |
+| `NSE.RELIANCE`  | `NSE_EQ\|INE002A01018`         |
+| `NSE.TCS`       | `NSE_EQ\|INE467B01029`         |
+| `NSE.INFY`      | `NSE_EQ\|INE009A01021`         |
+| … and more      | run `upstox-fetch keys`        |
